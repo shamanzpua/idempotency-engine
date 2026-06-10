@@ -1,0 +1,57 @@
+{
+  "name": "shamanzpua/idempotency-engine",
+  "description": "Framework-agnostic PHP idempotency engine for safe retries, concurrency control and duplicate suppression in distributed systems",
+  "type": "library",
+  "license": "MIT",
+  "keywords": [
+    "idempotency",
+    "distributed-systems",
+    "retries",
+    "concurrency",
+    "php",
+    "backend",
+    "api"
+  ],
+  "homepage": "https://github.com/shamanzpua/idempotency-engine",
+  "support": {
+    "issues": "https://github.com/shamanzpua/idempotency-engine/issues",
+    "source": "https://github.com/shamanzpua/idempotency-engine"
+  },
+  "authors": [
+    {
+      "name": "Yurii Azorskiy",
+      "role": "Developer"
+    }
+  ],
+  "require": {
+    "php": "^8.2"
+  },
+  "require-dev": {
+    "phpunit/phpunit": "^11.0",
+    "friendsofphp/php-cs-fixer": "^3.0",
+    "phpstan/phpstan": "^2.0",
+    "predis/predis": "^2.4"
+  },
+  "suggest": {
+    "ext-redis": "Required to use PhpRedisClient adapter",
+    "predis/predis": "Alternative Redis client via PredisClient adapter"
+  },
+  "autoload": {
+    "psr-4": {
+      "Shamanzpua\\Idempotency\\": "src/"
+    }
+  },
+  "autoload-dev": {
+    "psr-4": {
+      "Shamanzpua\\Idempotency\\Tests\\": "tests/"
+    }
+  },
+  "scripts": {
+    "test": "phpunit",
+    "test:unit": "phpunit --testsuite unit",
+    "analyse": "phpstan analyse",
+    "fix": "php-cs-fixer fix"
+  },
+  "minimum-stability": "stable",
+  "prefer-stable": true
+}
