@@ -9,5 +9,6 @@ enum ClaimStatus: string
     case CLAIMED = 'claimed';
     case ALREADY_COMPLETED = 'already_completed';
     case ALREADY_IN_PROGRESS = 'already_in_progress';
+    case ALREADY_FAILED = 'already_failed';
     case FINGERPRINT_MISMATCH = 'fingerprint_mismatch';
 }

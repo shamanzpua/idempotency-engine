@@ -14,6 +14,7 @@ declare(strict_types=1);
  */
 
 use Shamanzpua\Idempotency\Contract\IdempotencyStore;
+use Shamanzpua\Idempotency\Core\Model\ErrorDetails;
 use Shamanzpua\Idempotency\Core\ValueObject\ExecutionId;
 use Shamanzpua\Idempotency\Core\ValueObject\Fingerprint;
 use Shamanzpua\Idempotency\Core\ValueObject\Ttl;
@@ -33,6 +34,8 @@ $scope = $args[3] ?? '';
 $readyFile = $args[4] ?? '';
 $goFile = $args[5] ?? '';
 $resultFile = $args[6] ?? '';
+$mode = $args[7] ?? 'claim';          // claim | seedfail
+$reclaimFailed = ($args[8] ?? '0') === '1';
 
 $createStore = static function (string $backend): IdempotencyStore {
     switch ($backend) {
@@ -67,6 +70,18 @@ try {
     }
 
     $store = $createStore($backend);
+    $fingerprint = Fingerprint::fromString('fp-stress');
+
+    // Seed mode runs before any contention (no barrier): leave a FAILED record
+    // so a later reclaim round can contend on the FAILED -> IN_PROGRESS path.
+    if ($mode === 'seedfail') {
+        $owner = ExecutionId::generate();
+        $now = new \DateTimeImmutable();
+        $store->claim($key, $scope, $fingerprint, $owner, Ttl::fromSeconds(60), $now);
+        $store->fail($key, $scope, $owner, new ErrorDetails('SeedException', 'seed', 0), $now);
+        file_put_contents($resultFile, 'seeded');
+        exit(0);
+    }
 
     touch($readyFile);
 
@@ -81,10 +96,11 @@ try {
     $claim = $store->claim(
         key: $key,
         scope: $scope,
-        fingerprint: Fingerprint::fromString('fp-stress'),
+        fingerprint: $fingerprint,
         executionId: ExecutionId::generate(),
         ttl: Ttl::fromSeconds(60),
         now: new \DateTimeImmutable(),
+        reclaimFailed: $reclaimFailed,
     );
 
     file_put_contents($resultFile, $claim->status->value);

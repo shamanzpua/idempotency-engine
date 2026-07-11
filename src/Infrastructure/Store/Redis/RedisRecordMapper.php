@@ -52,7 +52,11 @@ final class RedisRecordMapper
                 'message' => $errorDetails->message,
                 'code' => $errorDetails->code,
             ],
-            JSON_THROW_ON_ERROR,
+            // JSON_INVALID_UTF8_SUBSTITUTE: exception messages can carry non-UTF-8
+            // bytes (crypto/iconv/native drivers). Substituting them keeps fail()
+            // from throwing a raw JsonException that would leave the record stuck
+            // IN_PROGRESS until its lease expires.
+            JSON_THROW_ON_ERROR | JSON_INVALID_UTF8_SUBSTITUTE,
         );
     }
 }

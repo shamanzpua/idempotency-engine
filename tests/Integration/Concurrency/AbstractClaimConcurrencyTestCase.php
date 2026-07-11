@@ -54,10 +54,69 @@ abstract class AbstractClaimConcurrencyTestCase extends TestCase
         }
     }
 
+    public function testExactlyOneConcurrentReclaimWins(): void
+    {
+        $key = sprintf('stress-reclaim-%s-%s', $this->backend(), bin2hex(random_bytes(4)));
+        $this->seedFailedRecord($key);
+
+        $statuses = $this->runContendedClaims($key, reclaimFailed: true);
+        $counts = array_count_values($statuses);
+        $context = sprintf('key "%s": %s', $key, json_encode($counts, JSON_THROW_ON_ERROR));
+
+        // Exactly one contender reclaims the FAILED record (CLAIMED). The other
+        // seven lose: each either still saw it FAILED or saw the winner's reclaimed
+        // IN_PROGRESS, depending on interleaving — but never a second CLAIMED.
+        self::assertSame(1, $counts[ClaimStatus::CLAIMED->value] ?? 0, 'expected exactly one reclaim to win; ' . $context);
+        $losers = ($counts[ClaimStatus::ALREADY_IN_PROGRESS->value] ?? 0)
+            + ($counts[ClaimStatus::ALREADY_FAILED->value] ?? 0);
+        self::assertSame(self::WORKERS - 1, $losers, 'expected all losers to observe ALREADY_IN_PROGRESS/ALREADY_FAILED; ' . $context);
+    }
+
+    private function seedFailedRecord(string $key): void
+    {
+        $dir = sys_get_temp_dir() . '/idem-seed-' . bin2hex(random_bytes(6));
+        if (!mkdir($dir)) {
+            self::fail(sprintf('Cannot create temp dir "%s".', $dir));
+        }
+
+        $resultFile = $dir . '/seed';
+
+        try {
+            $process = proc_open(
+                [
+                    PHP_BINARY,
+                    __DIR__ . '/worker.php',
+                    $this->backend(),
+                    $key,
+                    'stress',
+                    $dir . '/ready',
+                    $dir . '/go',
+                    $resultFile,
+                    'seedfail',
+                    '0',
+                ],
+                [1 => ['file', '/dev/null', 'w'], 2 => ['file', '/dev/null', 'w']],
+                $pipes,
+            );
+
+            if (!is_resource($process)) {
+                self::fail('Cannot spawn seed worker.');
+            }
+
+            proc_close($process); // waits for the seed worker to finish
+
+            $result = is_file($resultFile) ? (string) file_get_contents($resultFile) : '';
+            self::assertSame('seeded', $result, 'seed worker failed: ' . $result);
+        } finally {
+            array_map('unlink', glob($dir . '/*') ?: []);
+            rmdir($dir);
+        }
+    }
+
     /**
      * @return list<string>
      */
-    private function runContendedClaims(string $key): array
+    private function runContendedClaims(string $key, bool $reclaimFailed = false): array
     {
         $dir = sys_get_temp_dir() . '/idem-stress-' . bin2hex(random_bytes(6));
         if (!mkdir($dir)) {
@@ -84,6 +143,8 @@ abstract class AbstractClaimConcurrencyTestCase extends TestCase
                         $readyFiles[$i],
                         $goFile,
                         $resultFiles[$i],
+                        'claim',
+                        $reclaimFailed ? '1' : '0',
                     ],
                     [
                         1 => ['file', '/dev/null', 'w'],

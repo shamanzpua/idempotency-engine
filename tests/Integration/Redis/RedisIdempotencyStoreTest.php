@@ -16,11 +16,13 @@ use Shamanzpua\Idempotency\Exception\OwnershipViolationException;
 use Shamanzpua\Idempotency\Exception\RecordNotFoundException;
 use Shamanzpua\Idempotency\Infrastructure\Store\Redis\Client\PredisClient;
 use Shamanzpua\Idempotency\Infrastructure\Store\Redis\RedisIdempotencyStore;
+use Shamanzpua\Idempotency\Tests\Support\FixedClock;
 
 final class RedisIdempotencyStoreTest extends TestCase
 {
     private ?\Predis\Client $client = null;
     private ?RedisIdempotencyStore $store = null;
+    private FixedClock $clock;
 
     protected function setUp(): void
     {
@@ -35,9 +37,15 @@ final class RedisIdempotencyStoreTest extends TestCase
             self::markTestSkipped('REDIS_DSN is missing.');
         }
 
+        $this->clock = new FixedClock(new \DateTimeImmutable('2026-01-01 00:00:00+00:00'));
         $this->client = new \Predis\Client($dsn);
         $this->client->flushdb();
-        $this->store = new RedisIdempotencyStore(new PredisClient($this->client));
+        $this->store = new RedisIdempotencyStore(new PredisClient($this->client), clock: $this->clock);
+    }
+
+    private function physicalKey(string $scope, string $key): string
+    {
+        return sprintf('idempotency:%d:%s:%d:%s', strlen($scope), $scope, strlen($key), $key);
     }
 
     public function testClaimCreatesAndReturnsInProgressRecord(): void
@@ -171,11 +179,35 @@ final class RedisIdempotencyStoreTest extends TestCase
             executionId: ExecutionId::generate(),
             ttl: Ttl::fromSeconds(60),
             now: $now,
+            reclaimFailed: true,
         );
 
         self::assertSame(ClaimStatus::CLAIMED, $reclaim->status);
         self::assertNotNull($reclaim->record);
         self::assertSame(RecordStatus::IN_PROGRESS, $reclaim->record->status);
+    }
+
+    public function testClaimReturnsAlreadyFailedWithoutReclaimFlag(): void
+    {
+        $now = new \DateTimeImmutable('2026-01-01 00:00:00+00:00');
+        $owner = ExecutionId::generate();
+        $fingerprint = Fingerprint::fromString('fp-redis-already-failed');
+
+        $this->store->claim('redis-op-af', 'orders', $fingerprint, $owner, Ttl::fromSeconds(60), $now);
+        $this->store->fail('redis-op-af', 'orders', $owner, new ErrorDetails('RuntimeException', 'boom', 500), $now);
+
+        $claim = $this->store->claim(
+            key: 'redis-op-af',
+            scope: 'orders',
+            fingerprint: $fingerprint,
+            executionId: ExecutionId::generate(),
+            ttl: Ttl::fromSeconds(60),
+            now: $now,
+        );
+
+        self::assertSame(ClaimStatus::ALREADY_FAILED, $claim->status);
+        self::assertNotNull($claim->record);
+        self::assertSame(RecordStatus::FAILED, $claim->record->status);
     }
 
     public function testSecondClaimWhileInProgressReturnsAlreadyInProgressWithRecord(): void
@@ -208,7 +240,7 @@ final class RedisIdempotencyStoreTest extends TestCase
             $now->modify('+3600 seconds')->format(\DateTimeInterface::ATOM),
             $record->expiresAt->format(\DateTimeInterface::ATOM),
         );
-        $redisTtl = $this->client->ttl('idempotency:orders:redis-result-ttl-c');
+        $redisTtl = $this->client->ttl($this->physicalKey('orders', 'redis-result-ttl-c'));
         self::assertGreaterThan(3590, $redisTtl);
         self::assertLessThanOrEqual(3600, $redisTtl);
     }
@@ -228,7 +260,7 @@ final class RedisIdempotencyStoreTest extends TestCase
             $now->modify('+3600 seconds')->format(\DateTimeInterface::ATOM),
             $record->expiresAt->format(\DateTimeInterface::ATOM),
         );
-        $redisTtl = $this->client->ttl('idempotency:orders:redis-result-ttl-f');
+        $redisTtl = $this->client->ttl($this->physicalKey('orders', 'redis-result-ttl-f'));
         self::assertGreaterThan(3590, $redisTtl);
         self::assertLessThanOrEqual(3600, $redisTtl);
     }
@@ -241,7 +273,7 @@ final class RedisIdempotencyStoreTest extends TestCase
         $this->store->claim('redis-keep-ttl', 'orders', Fingerprint::fromString('fp-keep-ttl'), $owner, Ttl::fromSeconds(60), $now);
         $this->store->complete('redis-keep-ttl', 'orders', $owner, '{"ok":true}', $now);
 
-        $redisTtl = $this->client->ttl('idempotency:orders:redis-keep-ttl');
+        $redisTtl = $this->client->ttl($this->physicalKey('orders', 'redis-keep-ttl'));
         self::assertGreaterThan(55, $redisTtl);
         self::assertLessThanOrEqual(60, $redisTtl);
     }
@@ -250,7 +282,7 @@ final class RedisIdempotencyStoreTest extends TestCase
     {
         $now = new \DateTimeImmutable('2026-01-01 00:00:00+00:00');
         $owner = ExecutionId::generate();
-        $redisKey = 'idempotency:orders:redis-ttl-edge';
+        $redisKey = $this->physicalKey('orders', 'redis-ttl-edge');
 
         $this->store->claim('redis-ttl-edge', 'orders', Fingerprint::fromString('fp-ttl-edge'), $owner, Ttl::fromSeconds(60), $now);
         $this->client->pexpire($redisKey, 400);
@@ -265,7 +297,7 @@ final class RedisIdempotencyStoreTest extends TestCase
     {
         $now = new \DateTimeImmutable('2026-01-01 00:00:00+00:00');
         $owner = ExecutionId::generate();
-        $redisKey = 'idempotency:orders:redis-ttl-edge-fail';
+        $redisKey = $this->physicalKey('orders', 'redis-ttl-edge-fail');
 
         $this->store->claim('redis-ttl-edge-fail', 'orders', Fingerprint::fromString('fp-ttl-edge-fail'), $owner, Ttl::fromSeconds(60), $now);
         $this->client->pexpire($redisKey, 400);
@@ -281,5 +313,24 @@ final class RedisIdempotencyStoreTest extends TestCase
         $deleted = $this->store->deleteExpired(new \DateTimeImmutable('2026-01-01 00:00:00+00:00'));
 
         self::assertSame(0, $deleted);
+    }
+
+    public function testGetReturnsNullForExpiredRecord(): void
+    {
+        $now = $this->clock->now();
+        $this->store->claim(
+            key: 'redis-get-expired',
+            scope: 'orders',
+            fingerprint: Fingerprint::fromString('fp-get-expired'),
+            executionId: ExecutionId::generate(),
+            ttl: Ttl::fromSeconds(30),
+            now: $now,
+        );
+
+        self::assertNotNull($this->store->get('redis-get-expired', 'orders'));
+
+        $this->clock->set($now->modify('+31 seconds'));
+
+        self::assertNull($this->store->get('redis-get-expired', 'orders'));
     }
 }

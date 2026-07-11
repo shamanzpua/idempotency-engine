@@ -24,7 +24,6 @@ use Shamanzpua\Idempotency\Enum\RecordStatus;
 use Shamanzpua\Idempotency\Exception\FingerprintMismatchException;
 use Shamanzpua\Idempotency\Exception\OperationFailedException;
 use Shamanzpua\Idempotency\Exception\OperationInProgressException;
-use Shamanzpua\Idempotency\Exception\OperationStalledException;
 use Shamanzpua\Idempotency\Support\Clock\Clock;
 
 final readonly class DefaultIdempotencyEngine implements IdempotencyEngine
@@ -41,6 +40,16 @@ final readonly class DefaultIdempotencyEngine implements IdempotencyEngine
 
     public function execute(string $key, callable $operation, ?ExecutionOptions $options = null): mixed
     {
+        if ($key === '') {
+            throw new \InvalidArgumentException('Idempotency key cannot be empty.');
+        }
+
+        if (strlen($key) > ExecutionOptions::MAX_KEY_LENGTH) {
+            throw new \InvalidArgumentException(
+                sprintf('Idempotency key cannot exceed %d bytes.', ExecutionOptions::MAX_KEY_LENGTH),
+            );
+        }
+
         $options = $options ?? new ExecutionOptions();
 
         return $this->executeInternal(
@@ -58,18 +67,20 @@ final readonly class DefaultIdempotencyEngine implements IdempotencyEngine
         ExecutionOptions $options,
         Fingerprint $fingerprint,
         int $retryBudget,
+        bool $reclaimFailed = false,
     ): mixed {
         $now = $this->clock->now();
         $executionId = ExecutionId::generate();
         $ttl = $options->ttl ?? $this->defaultTtl;
         $resultTtl = $options->resultTtl;
 
-        $claim = $this->store->claim($key, $options->scope, $fingerprint, $executionId, $ttl, $now);
+        $claim = $this->store->claim($key, $options->scope, $fingerprint, $executionId, $ttl, $now, $reclaimFailed);
 
         return match ($claim->status) {
             ClaimStatus::CLAIMED => $this->executeClaimed($key, $operation, $options, $executionId, $fingerprint, $retryBudget, $resultTtl),
             ClaimStatus::ALREADY_COMPLETED => $this->replay($claim->record),
-            ClaimStatus::ALREADY_IN_PROGRESS => $this->handleInProgress($key, $options, $claim->record, $operation, $fingerprint),
+            ClaimStatus::ALREADY_IN_PROGRESS => $this->handleInProgress($key, $options, $claim->record, $operation, $fingerprint, $retryBudget),
+            ClaimStatus::ALREADY_FAILED => $this->handleAlreadyFailed($key, $operation, $options, $claim->record, $fingerprint, $retryBudget),
             ClaimStatus::FINGERPRINT_MISMATCH => throw new FingerprintMismatchException($key, $options->scope),
         };
     }
@@ -129,7 +140,7 @@ final readonly class DefaultIdempotencyEngine implements IdempotencyEngine
         $this->markAsFailed($key, $options->scope, $executionId, $throwable, $resultTtl);
 
         if ($this->canRetry($options, $retryBudget)) {
-            return $this->executeInternal($key, $operation, $options, $fingerprint, $retryBudget - 1);
+            return $this->executeInternal($key, $operation, $options, $fingerprint, $retryBudget - 1, reclaimFailed: true);
         }
 
         throw $throwable;
@@ -167,6 +178,7 @@ final readonly class DefaultIdempotencyEngine implements IdempotencyEngine
         ?IdempotencyRecord $record,
         callable $operation,
         Fingerprint $fingerprint,
+        int $retryBudget,
     ): mixed
     {
         if ($record === null) {
@@ -179,7 +191,7 @@ final readonly class DefaultIdempotencyEngine implements IdempotencyEngine
             throw new OperationInProgressException($key, $options->scope);
         }
 
-        return $this->waitAndReplay($key, $options, $operation, $fingerprint);
+        return $this->waitAndReplay($key, $options, $operation, $fingerprint, $retryBudget);
     }
 
     private function waitAndReplay(
@@ -187,6 +199,7 @@ final readonly class DefaultIdempotencyEngine implements IdempotencyEngine
         ExecutionOptions $options,
         callable $operation,
         Fingerprint $fingerprint,
+        int $retryBudget,
     ): mixed
     {
         $scope = $options->scope;
@@ -196,15 +209,29 @@ final readonly class DefaultIdempotencyEngine implements IdempotencyEngine
         while ($this->clock->now() < $deadlineAt) {
             $record = $this->store->get($key, $scope);
 
+            if ($record === null) {
+                // The holder's record is gone: an expiry-aware store hides a
+                // logically expired in-progress lease (crashed holder) or a
+                // completed result whose window closed. Either way the claim is
+                // free — take over with a fresh attempt instead of spinning to
+                // the timeout. claim() reclaims the expired row atomically.
+                // Carry the residual budget so takeovers can't re-arm retries
+                // and push executions past maxRetries + 1 for this execute().
+                return $this->executeInternal($key, $operation, $options, $fingerprint, $retryBudget);
+            }
+
             if ($this->isReplayable($record)) {
                 return $this->replay($record);
             }
 
             if ($this->isFailed($record)) {
-                return $this->handleFailedRecord($key, $operation, $options, $record, $fingerprint);
+                return $this->handleFailedRecord($key, $operation, $options, $record, $fingerprint, $retryBudget);
             }
 
-            $this->guardAgainstStaleRecord($key, $scope, $record);
+            // The record is a still-live in-progress lease held by someone else:
+            // keep polling. A crashed holder is recovered without a dedicated
+            // staleness signal — once its lease expires, get() reports it absent
+            // and the null branch above takes the claim over on the next poll.
             $backoffMs = $this->sleepAndIncreaseBackoff($backoffMs, $options);
         }
 
@@ -223,29 +250,44 @@ final readonly class DefaultIdempotencyEngine implements IdempotencyEngine
         return $record !== null && $record->status === RecordStatus::FAILED;
     }
 
+    private function handleAlreadyFailed(
+        string $key,
+        callable $operation,
+        ExecutionOptions $options,
+        ?IdempotencyRecord $record,
+        Fingerprint $fingerprint,
+        int $retryBudget,
+    ): mixed {
+        if ($record === null) {
+            throw new \LogicException('Already-failed claim must provide record.');
+        }
+
+        return $this->handleFailedRecord($key, $operation, $options, $record, $fingerprint, $retryBudget);
+    }
+
     private function handleFailedRecord(
         string $key,
         callable $operation,
         ExecutionOptions $options,
         IdempotencyRecord $record,
         Fingerprint $fingerprint,
+        int $retryBudget,
     ): mixed {
         if ($this->policy->onFailed($options, $record) === FailedStrategy::THROW) {
             throw new OperationFailedException($key, $options->scope, $record->errorDetails);
         }
 
-        return $this->executeInternal($key, $operation, $options, $fingerprint, 0);
-    }
-
-    private function guardAgainstStaleRecord(string $key, string $scope, ?IdempotencyRecord $record): void
-    {
-        if ($record === null || $record->status !== RecordStatus::IN_PROGRESS) {
-            return;
+        // RETRY: reclaim the failed record and re-run, carrying the *residual*
+        // budget rather than re-arming a fresh maxRetries. Decrementing stays the
+        // sole job of handleExecutionFailure (one unit per actual run), so the
+        // total run count for this execute() stays capped at maxRetries + 1.
+        // A spent budget surfaces the last failure instead of recursing, which
+        // also bounds ping-pong when concurrent callers keep re-failing the key.
+        if ($retryBudget <= 0) {
+            throw new OperationFailedException($key, $options->scope, $record->errorDetails);
         }
 
-        if ($this->policy->isStale($record, $this->clock->now())) {
-            throw new OperationStalledException($key, $scope);
-        }
+        return $this->executeInternal($key, $operation, $options, $fingerprint, $retryBudget, reclaimFailed: true);
     }
 
     private function sleepAndIncreaseBackoff(int $backoffMs, ExecutionOptions $options): int

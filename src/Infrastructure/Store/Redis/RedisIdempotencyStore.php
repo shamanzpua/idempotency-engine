@@ -19,6 +19,8 @@ use Shamanzpua\Idempotency\Exception\OwnershipViolationException;
 use Shamanzpua\Idempotency\Exception\RecordNotFoundException;
 use Shamanzpua\Idempotency\Exception\StoreException;
 use Shamanzpua\Idempotency\Infrastructure\Store\Redis\Client\RedisClient;
+use Shamanzpua\Idempotency\Support\Clock\Clock;
+use Shamanzpua\Idempotency\Support\Clock\SystemClock;
 
 final class RedisIdempotencyStore implements IdempotencyStore, ExpirableStore
 {
@@ -26,6 +28,7 @@ final class RedisIdempotencyStore implements IdempotencyStore, ExpirableStore
         private readonly RedisClient $client,
         private readonly RedisRecordMapper $mapper = new RedisRecordMapper(),
         private readonly string $prefix = 'idempotency',
+        private readonly Clock $clock = new SystemClock(),
     ) {}
 
     public function claim(
@@ -35,10 +38,11 @@ final class RedisIdempotencyStore implements IdempotencyStore, ExpirableStore
         ExecutionId $executionId,
         Ttl $ttl,
         \DateTimeImmutable $now,
+        bool $reclaimFailed = false,
     ): ClaimResult {
         $ttlSeconds = $ttl->inSeconds();
-        $nowString = $now->format(\DateTimeInterface::ATOM);
-        $expiresAt = $now->modify(sprintf('+%d seconds', $ttlSeconds))->format(\DateTimeInterface::ATOM);
+        $nowString = $this->formatUtc($now);
+        $expiresAt = $this->formatUtc($now->modify(sprintf('+%d seconds', $ttlSeconds)));
         $redisKey = $this->recordKey($key, $scope);
 
         try {
@@ -52,6 +56,7 @@ final class RedisIdempotencyStore implements IdempotencyStore, ExpirableStore
                     RecordStatus::IN_PROGRESS->value,
                     $nowString,
                     $expiresAt,
+                    $reclaimFailed ? '1' : '0',
                 ],
             );
         } catch (\Throwable $exception) {
@@ -77,6 +82,7 @@ final class RedisIdempotencyStore implements IdempotencyStore, ExpirableStore
             'claimed' => new ClaimResult(ClaimStatus::CLAIMED, $record, $executionId),
             'completed' => new ClaimResult(ClaimStatus::ALREADY_COMPLETED, $record, null),
             'in_progress' => new ClaimResult(ClaimStatus::ALREADY_IN_PROGRESS, $record, null),
+            'already_failed' => new ClaimResult(ClaimStatus::ALREADY_FAILED, $record, null),
             'fingerprint_mismatch' => new ClaimResult(ClaimStatus::FINGERPRINT_MISMATCH, $record, null),
             default => throw new StoreException(sprintf('Unexpected claim response from Redis script: %s', $status)),
         };
@@ -93,7 +99,16 @@ final class RedisIdempotencyStore implements IdempotencyStore, ExpirableStore
             /** @var array<string, mixed> $decoded */
             $decoded = json_decode($raw, true, 512, JSON_THROW_ON_ERROR);
 
-            return $this->mapper->mapArrayToRecord($key, $scope, $decoded);
+            $record = $this->mapper->mapArrayToRecord($key, $scope, $decoded);
+
+            // Uniform expiry-aware get() contract: never return a logically
+            // expired record, even in the rare window where the key physically
+            // outlives its logical expiry (see IdempotencyStore::get()).
+            if ($record->expiresAt <= $this->clock->now()) {
+                return null;
+            }
+
+            return $record;
         } catch (\Throwable $exception) {
             throw new StoreException('Failed to read idempotency record.', 0, $exception);
         }
@@ -150,9 +165,31 @@ final class RedisIdempotencyStore implements IdempotencyStore, ExpirableStore
         return 0;
     }
 
+    /**
+     * Fixed-width UTC timestamp with microseconds, e.g. 2026-01-01T00:00:01.900000Z.
+     *
+     * The CLAIM script compares expiry lexically (data.expires_at <= now), so the
+     * format must make lexical order equal chronological order. Two properties are
+     * required and both are provided here:
+     *   - always UTC ("Z"), so a mixed-timezone or DST-transitioning fleet cannot
+     *     mis-order a live lease (differing offsets break a lexical compare);
+     *   - microsecond precision, matching the PDO (DATETIME(6)) and InMemory stores.
+     *     ISO-8601 ATOM truncates to whole seconds, which would let a claim taken at
+     *     ...00.900 with a 1s TTL be reclaimed ~900ms early (a sub-second double-flight
+     *     window), because the physical Redis EX key is still alive.
+     */
+    private const TIMESTAMP_FORMAT = 'Y-m-d\TH:i:s.u\Z';
+
+    private function formatUtc(\DateTimeImmutable $dateTime): string
+    {
+        return $dateTime->setTimezone(new \DateTimeZone('UTC'))->format(self::TIMESTAMP_FORMAT);
+    }
+
     private function recordKey(string $key, string $scope): string
     {
-        return sprintf('%s:%s:%s', $this->prefix, $scope, $key);
+        // Length-prefixed encoding so distinct (scope, key) pairs can never map to
+        // the same physical key (e.g. scope "a:b"/key "c" vs scope "a"/key "b:c").
+        return sprintf('%s:%d:%s:%d:%s', $this->prefix, strlen($scope), $scope, strlen($key), $key);
     }
 
     private function throwForLuaStatus(string $status, string $key, string $scope): void
@@ -180,7 +217,7 @@ final class RedisIdempotencyStore implements IdempotencyStore, ExpirableStore
     ): string {
         $resultTtlSeconds = $resultTtl?->inSeconds() ?? 0;
         $newExpiresAt = $resultTtl !== null
-            ? $now->modify(sprintf('+%d seconds', $resultTtlSeconds))->format(\DateTimeInterface::ATOM)
+            ? $this->formatUtc($now->modify(sprintf('+%d seconds', $resultTtlSeconds)))
             : '';
 
         try {
@@ -190,7 +227,7 @@ final class RedisIdempotencyStore implements IdempotencyStore, ExpirableStore
                 [
                     $executionId->toString(),
                     $payload,
-                    $now->format(\DateTimeInterface::ATOM),
+                    $this->formatUtc($now),
                     (string) $resultTtlSeconds,
                     $newExpiresAt,
                 ],

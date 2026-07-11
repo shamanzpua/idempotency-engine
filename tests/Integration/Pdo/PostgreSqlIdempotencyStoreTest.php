@@ -47,6 +47,11 @@ final class PostgreSqlIdempotencyStoreTest extends AbstractPdoIdempotencyStoreIn
 
     protected function createStore(\PDO $pdo): PdoIdempotencyStore
     {
-        return new PdoIdempotencyStore($pdo, dialect: new PostgreSqlDialect());
+        return new PdoIdempotencyStore($pdo, dialect: new PostgreSqlDialect(), clock: $this->clock);
+    }
+
+    protected function createProbeStore(\PDO $pdo): VanishOnceClaimStore
+    {
+        return new VanishOnceClaimStore($pdo, dialect: new PostgreSqlDialect());
     }
 }

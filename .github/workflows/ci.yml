@@ -1,0 +1,143 @@
+name: CI
+
+on:
+  push:
+    branches: [main, 'stable-*']
+    tags: ['v*']
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    strategy:
+      fail-fast: false
+      matrix:
+        php: ['8.2', '8.3', '8.4', '8.5']
+
+    services:
+      mysql:
+        image: mysql:8.0
+        env:
+          MYSQL_ROOT_PASSWORD: root
+          MYSQL_DATABASE: idempotency
+          MYSQL_USER: idempotency
+          MYSQL_PASSWORD: idempotency
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd="mysqladmin ping -h 127.0.0.1 -uroot -proot --silent"
+          --health-interval=10s --health-timeout=5s --health-retries=10
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_DB: idempotency
+          POSTGRES_USER: idempotency
+          POSTGRES_PASSWORD: idempotency
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd="pg_isready -U idempotency" --health-interval=10s
+          --health-timeout=5s --health-retries=10
+      redis:
+        image: redis:7
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd="redis-cli ping" --health-interval=10s
+          --health-timeout=5s --health-retries=10
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Setup PHP
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: ${{ matrix.php }}
+          # redis (phpredis) is installed so the Redis contract suite runs against
+          # both the Predis and the phpredis clients, not just Predis.
+          extensions: pdo_mysql, pdo_pgsql, redis
+          tools: composer:v2
+          coverage: none
+
+      - name: Validate composer.json
+        run: composer validate --strict
+
+      - name: Install dependencies
+        run: composer install --no-interaction --prefer-dist
+
+      - name: Audit dependencies
+        run: composer audit
+
+      - name: Static analysis
+        run: composer analyse -- --memory-limit=512M
+
+      - name: Unit tests
+        run: composer test:unit
+
+      - name: Initialise schemas
+        env:
+          MYSQL_PWD: idempotency
+          PGPASSWORD: idempotency
+        run: |
+          mysql -h 127.0.0.1 -u idempotency idempotency < resources/sql/idempotency_records.mysql.sql
+          psql -h 127.0.0.1 -U idempotency -d idempotency -f resources/sql/idempotency_records.postgresql.sql
+
+      - name: Integration and concurrency tests
+        env:
+          DB_DSN: mysql:host=127.0.0.1;port=3306;dbname=idempotency;charset=utf8mb4
+          DB_USER: idempotency
+          DB_PASSWORD: idempotency
+          PG_DB_DSN: pgsql:host=127.0.0.1;port=5432;dbname=idempotency
+          PG_DB_USER: idempotency
+          PG_DB_PASSWORD: idempotency
+          REDIS_DSN: tcp://127.0.0.1:6379
+        run: ./vendor/bin/phpunit --testsuite integration
+
+  # MariaDB is a publicly supported backend (README), so verify the MySQL dialect
+  # against it too. One PHP version is enough — this is a compatibility gate, not a
+  # full matrix.
+  mariadb:
+    runs-on: ubuntu-latest
+
+    services:
+      mariadb:
+        image: mariadb:10.11
+        env:
+          MARIADB_ROOT_PASSWORD: root
+          MARIADB_DATABASE: idempotency
+          MARIADB_USER: idempotency
+          MARIADB_PASSWORD: idempotency
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd="healthcheck.sh --connect --innodb_initialized"
+          --health-interval=10s --health-timeout=5s --health-retries=10
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Setup PHP
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.3'
+          extensions: pdo_mysql
+          tools: composer:v2
+          coverage: none
+
+      - name: Install dependencies
+        run: composer install --no-interaction --prefer-dist
+
+      - name: Initialise schema
+        env:
+          MYSQL_PWD: idempotency
+        run: mysql -h 127.0.0.1 -u idempotency idempotency < resources/sql/idempotency_records.mysql.sql
+
+      - name: MySQL-dialect integration tests on MariaDB
+        env:
+          DB_DSN: mysql:host=127.0.0.1;port=3306;dbname=idempotency;charset=utf8mb4
+          DB_USER: idempotency
+          DB_PASSWORD: idempotency
+        run: ./vendor/bin/phpunit tests/Integration/Pdo/MySqlIdempotencyStoreTest.php tests/Integration/Contract/MySqlStoreContractTest.php

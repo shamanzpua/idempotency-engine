@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace Shamanzpua\Idempotency\Tests\Integration\Pdo;
 
 use PHPUnit\Framework\TestCase;
+use Shamanzpua\Idempotency\Core\Model\ClaimResult;
 use Shamanzpua\Idempotency\Core\Model\ErrorDetails;
 use Shamanzpua\Idempotency\Core\ValueObject\ExecutionId;
 use Shamanzpua\Idempotency\Core\ValueObject\Fingerprint;
@@ -15,11 +16,13 @@ use Shamanzpua\Idempotency\Exception\IllegalStateTransitionException;
 use Shamanzpua\Idempotency\Exception\OwnershipViolationException;
 use Shamanzpua\Idempotency\Exception\RecordNotFoundException;
 use Shamanzpua\Idempotency\Infrastructure\Store\Pdo\PdoIdempotencyStore;
+use Shamanzpua\Idempotency\Tests\Support\FixedClock;
 
 abstract class AbstractPdoIdempotencyStoreIntegrationTestCase extends TestCase
 {
     protected ?\PDO $pdo = null;
     protected ?PdoIdempotencyStore $store = null;
+    protected FixedClock $clock;
 
     abstract protected function createPdo(): ?\PDO;
 
@@ -29,9 +32,13 @@ abstract class AbstractPdoIdempotencyStoreIntegrationTestCase extends TestCase
 
     abstract protected function createStore(\PDO $pdo): PdoIdempotencyStore;
 
+    abstract protected function createProbeStore(\PDO $pdo): VanishOnceClaimStore;
+
     protected function setUp(): void
     {
         parent::setUp();
+
+        $this->clock = new FixedClock(new \DateTimeImmutable('2026-01-01 00:00:00'));
 
         $this->pdo = $this->createPdo();
         if ($this->pdo === null) {
@@ -173,11 +180,35 @@ abstract class AbstractPdoIdempotencyStoreIntegrationTestCase extends TestCase
             executionId: ExecutionId::generate(),
             ttl: Ttl::fromSeconds(60),
             now: $now,
+            reclaimFailed: true,
         );
 
         self::assertSame(ClaimStatus::CLAIMED, $reclaim->status);
         self::assertNotNull($reclaim->record);
         self::assertSame(RecordStatus::IN_PROGRESS, $reclaim->record->status);
+    }
+
+    public function testClaimReturnsAlreadyFailedWithoutReclaimFlag(): void
+    {
+        $now = new \DateTimeImmutable('2026-01-01 00:00:00');
+        $owner = ExecutionId::generate();
+        $fingerprint = Fingerprint::fromString('fp-already-failed');
+
+        $this->store->claim('pdo-op-af', 'orders', $fingerprint, $owner, Ttl::fromSeconds(60), $now);
+        $this->store->fail('pdo-op-af', 'orders', $owner, new ErrorDetails('RuntimeException', 'boom', 500), $now);
+
+        $claim = $this->store->claim(
+            key: 'pdo-op-af',
+            scope: 'orders',
+            fingerprint: $fingerprint,
+            executionId: ExecutionId::generate(),
+            ttl: Ttl::fromSeconds(60),
+            now: $now,
+        );
+
+        self::assertSame(ClaimStatus::ALREADY_FAILED, $claim->status);
+        self::assertNotNull($claim->record);
+        self::assertSame(RecordStatus::FAILED, $claim->record->status);
     }
 
     public function testSecondClaimWhileInProgressReturnsAlreadyInProgress(): void
@@ -244,6 +275,84 @@ abstract class AbstractPdoIdempotencyStoreIntegrationTestCase extends TestCase
         self::assertEquals($now->modify('+3600 seconds'), $record->expiresAt);
     }
 
+    public function testClaimPreservesInstantWhenNowIsInNonUtcTimezone(): void
+    {
+        // Same instant as 2026-01-01 05:00:00 UTC, expressed in a non-UTC zone.
+        $now = new \DateTimeImmutable('2026-01-01 00:00:00', new \DateTimeZone('America/New_York'));
+        $this->store->claim(
+            key: 'pdo-tz',
+            scope: 'orders',
+            fingerprint: Fingerprint::fromString('fp-tz'),
+            executionId: ExecutionId::generate(),
+            ttl: Ttl::fromSeconds(3600),
+            now: $now,
+        );
+
+        $record = $this->store->get('pdo-tz', 'orders');
+
+        self::assertNotNull($record);
+        self::assertSame($now->getTimestamp(), $record->createdAt->getTimestamp());
+        self::assertSame($now->modify('+3600 seconds')->getTimestamp(), $record->expiresAt->getTimestamp());
+    }
+
+    public function testClaimRetriesWhenConflictingRowVanishesDuringResolution(): void
+    {
+        $probe = $this->createProbeStore($this->pdo);
+        $now = new \DateTimeImmutable('2026-01-01 00:00:00');
+
+        $claim = $probe->claim(
+            key: 'pdo-vanish',
+            scope: 'orders',
+            fingerprint: Fingerprint::fromString('fp-vanish'),
+            executionId: ExecutionId::generate(),
+            ttl: Ttl::fromSeconds(60),
+            now: $now,
+        );
+
+        // First attempt simulated a vanished conflicting row; the claim retried
+        // instead of failing, and the second attempt inserted the record.
+        self::assertSame(2, $probe->attempts);
+        self::assertSame(ClaimStatus::CLAIMED, $claim->status);
+        self::assertNotNull($claim->record);
+        self::assertSame(RecordStatus::IN_PROGRESS, $claim->record->status);
+    }
+
+    public function testPreservesMicrosecondPrecisionInTimestamps(): void
+    {
+        $now = new \DateTimeImmutable('2026-01-01 00:00:00.123456');
+        $this->store->claim('pdo-micro', 'orders', Fingerprint::fromString('fp-micro'), ExecutionId::generate(), Ttl::fromSeconds(60), $now);
+
+        $record = $this->store->get('pdo-micro', 'orders');
+
+        self::assertNotNull($record);
+        self::assertSame('123456', $record->createdAt->format('u'));
+        self::assertSame('123456', $record->expiresAt->format('u'));
+    }
+
+    public function testStoresVersionedCanonicalFingerprint(): void
+    {
+        $now = new \DateTimeImmutable('2026-01-01 00:00:00');
+        $fingerprint = Fingerprint::fromString('v1:' . str_repeat('a', 64)); // 67 chars
+
+        $this->store->claim('pdo-fp', 'orders', $fingerprint, ExecutionId::generate(), Ttl::fromSeconds(60), $now);
+
+        $record = $this->store->get('pdo-fp', 'orders');
+        self::assertNotNull($record);
+        self::assertTrue($record->fingerprint->equals($fingerprint));
+    }
+
+    public function testKeysAreCaseSensitive(): void
+    {
+        $now = new \DateTimeImmutable('2026-01-01 00:00:00');
+
+        $upper = $this->store->claim('CASE-KEY', 'orders', Fingerprint::fromString('fp-u'), ExecutionId::generate(), Ttl::fromSeconds(60), $now);
+        $lower = $this->store->claim('case-key', 'orders', Fingerprint::fromString('fp-l'), ExecutionId::generate(), Ttl::fromSeconds(60), $now);
+
+        // Distinct keys differing only by case must both be claimable.
+        self::assertSame(ClaimStatus::CLAIMED, $upper->status);
+        self::assertSame(ClaimStatus::CLAIMED, $lower->status);
+    }
+
     public function testThrowsWhenTableNameIsInvalid(): void
     {
         $this->expectException(\InvalidArgumentException::class);
@@ -278,5 +387,51 @@ abstract class AbstractPdoIdempotencyStoreIntegrationTestCase extends TestCase
         self::assertSame(1, $deleted);
         self::assertNull($this->store->get('pdo-expired', 'orders'));
         self::assertNotNull($this->store->get('pdo-active', 'orders'));
+    }
+
+    public function testGetReturnsNullForExpiredRecord(): void
+    {
+        $now = $this->clock->now();
+        $this->store->claim(
+            key: 'pdo-get-expired',
+            scope: 'orders',
+            fingerprint: Fingerprint::fromString('fp-get-expired'),
+            executionId: ExecutionId::generate(),
+            ttl: Ttl::fromSeconds(30),
+            now: $now,
+        );
+
+        self::assertNotNull($this->store->get('pdo-get-expired', 'orders'));
+
+        $this->clock->set($now->modify('+31 seconds'));
+
+        self::assertNull($this->store->get('pdo-get-expired', 'orders'));
+    }
+}
+
+/**
+ * Simulates the conflicting row vanishing between the upsert and the locking read
+ * on the first claim attempt, then delegates to the real logic.
+ */
+final class VanishOnceClaimStore extends PdoIdempotencyStore
+{
+    public int $attempts = 0;
+
+    protected function attemptClaim(
+        string $key,
+        string $scope,
+        Fingerprint $fingerprint,
+        ExecutionId $executionId,
+        Ttl $ttl,
+        \DateTimeImmutable $now,
+        bool $reclaimFailed = false,
+    ): ?ClaimResult {
+        $this->attempts++;
+
+        if ($this->attempts === 1) {
+            return null;
+        }
+
+        return parent::attemptClaim($key, $scope, $fingerprint, $executionId, $ttl, $now, $reclaimFailed);
     }
 }

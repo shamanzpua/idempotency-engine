@@ -12,6 +12,7 @@ use Shamanzpua\Idempotency\Enum\InProgressStrategy;
 final readonly class ExecutionOptions
 {
     public const DEFAULT_SCOPE = 'default';
+    public const MAX_KEY_LENGTH = 191;
     public const DEFAULT_WAIT_TIMEOUT_MS = 1_000;
     public const DEFAULT_INITIAL_BACKOFF_MS = 25;
     public const DEFAULT_MAX_BACKOFF_MS = 250;
@@ -34,6 +35,10 @@ final readonly class ExecutionOptions
     ) {
         if ($this->scope === '') {
             throw new \InvalidArgumentException('Scope cannot be empty.');
+        }
+
+        if (strlen($this->scope) > self::MAX_KEY_LENGTH) {
+            throw new \InvalidArgumentException(sprintf('Scope cannot exceed %d bytes.', self::MAX_KEY_LENGTH));
         }
 
         if ($this->waitTimeoutMs <= 0) {

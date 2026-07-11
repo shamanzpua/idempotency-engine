@@ -21,9 +21,4 @@ final class DefaultExecutionPolicy implements ExecutionPolicy
     {
         return $options->failedStrategy;
     }
-
-    public function isStale(IdempotencyRecord $record, \DateTimeImmutable $now): bool
-    {
-        return $record->expiresAt <= $now;
-    }
 }

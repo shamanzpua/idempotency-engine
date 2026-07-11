@@ -7,8 +7,7 @@ namespace Shamanzpua\Idempotency\Infrastructure\Store\Redis;
 final class LuaScripts
 {
     public const CLAIM = <<<'LUA'
-local raw = redis.call('GET', KEYS[1])
-if raw == false then
+local function claim_fresh()
     local record = cjson.encode({
         fingerprint = ARGV[1],
         execution_id = ARGV[2],
@@ -23,10 +22,19 @@ if raw == false then
     return {'claimed', record}
 end
 
+local raw = redis.call('GET', KEYS[1])
+if raw == false then return claim_fresh() end
+
 local data = cjson.decode(raw)
+-- Logical expiry (caller's clock, ARGV[5]) parity with the PDO/InMemory stores:
+-- a physically-present but logically expired record is reclaimed as fresh.
+-- expires_at and now are fixed-width UTC timestamps with microseconds
+-- (RedisIdempotencyStore::formatUtc), so a lexical compare == a chronological one.
+if data.expires_at <= ARGV[5] then return claim_fresh() end
 if data.fingerprint ~= ARGV[1] then return {'fingerprint_mismatch', raw} end
 if data.status == 'completed' then return {'completed', raw} end
 if data.status == 'failed' then
+    if ARGV[7] ~= '1' then return {'already_failed', raw} end
     data.status = ARGV[4]
     data.execution_id = ARGV[2]
     data.result_payload = cjson.null

@@ -72,6 +72,11 @@ final class MySqlIdempotencyStoreTest extends AbstractPdoIdempotencyStoreIntegra
 
     protected function createStore(\PDO $pdo): PdoIdempotencyStore
     {
-        return new PdoIdempotencyStore($pdo, dialect: new MySqlDialect());
+        return new PdoIdempotencyStore($pdo, dialect: new MySqlDialect(), clock: $this->clock);
+    }
+
+    protected function createProbeStore(\PDO $pdo): VanishOnceClaimStore
+    {
+        return new VanishOnceClaimStore($pdo, dialect: new MySqlDialect());
     }
 }

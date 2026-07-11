@@ -8,12 +8,17 @@ final class MySqlDialect implements PdoDialect
 {
     public function formatDateTime(\DateTimeImmutable $dateTime): string
     {
-        return $dateTime->format('Y-m-d H:i:s');
+        // Persist a canonical UTC wall-clock value with microseconds: DATETIME(6)
+        // carries no timezone, so normalizing here keeps expires_at comparisons
+        // correct across timezones, and sub-second precision matches PostgreSQL.
+        return $dateTime->setTimezone(new \DateTimeZone('UTC'))->format('Y-m-d H:i:s.u');
     }
 
     public function parseDateTime(string $value): \DateTimeImmutable
     {
-        return new \DateTimeImmutable($value);
+        // Stored values are UTC wall-clock (see formatDateTime); interpret them as
+        // UTC instead of relying on the process default timezone.
+        return new \DateTimeImmutable($value, new \DateTimeZone('UTC'));
     }
 
     public function insertInProgressSql(string $table): string

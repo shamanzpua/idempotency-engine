@@ -17,6 +17,8 @@ use Shamanzpua\Idempotency\Enum\RecordStatus;
 use Shamanzpua\Idempotency\Exception\IllegalStateTransitionException;
 use Shamanzpua\Idempotency\Exception\OwnershipViolationException;
 use Shamanzpua\Idempotency\Exception\RecordNotFoundException;
+use Shamanzpua\Idempotency\Support\Clock\Clock;
+use Shamanzpua\Idempotency\Support\Clock\SystemClock;
 
 /**
  * In-memory implementation intended for tests and simple single-process scenarios.
@@ -28,6 +30,10 @@ final class InMemoryIdempotencyStore implements IdempotencyStore, ExpirableStore
     /** @var array<string, IdempotencyRecord> */
     private array $records = [];
 
+    public function __construct(
+        private readonly Clock $clock = new SystemClock(),
+    ) {}
+
     public function claim(
         string $key,
         string $scope,
@@ -35,6 +41,7 @@ final class InMemoryIdempotencyStore implements IdempotencyStore, ExpirableStore
         ExecutionId $executionId,
         Ttl $ttl,
         \DateTimeImmutable $now,
+        bool $reclaimFailed = false,
     ): ClaimResult {
         $recordKey = $this->recordKey($key, $scope);
         $existing = $this->records[$recordKey] ?? null;
@@ -70,13 +77,21 @@ final class InMemoryIdempotencyStore implements IdempotencyStore, ExpirableStore
         return match ($existing->status) {
             RecordStatus::COMPLETED => new ClaimResult(ClaimStatus::ALREADY_COMPLETED, $existing, null),
             RecordStatus::IN_PROGRESS => new ClaimResult(ClaimStatus::ALREADY_IN_PROGRESS, $existing, null),
-            RecordStatus::FAILED => $this->reclaimFailed($existing, $executionId, $ttl, $now),
+            RecordStatus::FAILED => $reclaimFailed
+                ? $this->reclaimFailed($existing, $executionId, $ttl, $now)
+                : new ClaimResult(ClaimStatus::ALREADY_FAILED, $existing, null),
         };
     }
 
     public function get(string $key, string $scope): ?IdempotencyRecord
     {
-        return $this->records[$this->recordKey($key, $scope)] ?? null;
+        $record = $this->records[$this->recordKey($key, $scope)] ?? null;
+
+        if ($record !== null && $record->expiresAt <= $this->clock->now()) {
+            return null;
+        }
+
+        return $record;
     }
 
     public function complete(
@@ -193,7 +208,11 @@ final class InMemoryIdempotencyStore implements IdempotencyStore, ExpirableStore
 
     private function requireRecord(string $key, string $scope): IdempotencyRecord
     {
-        $record = $this->get($key, $scope);
+        // The write path (complete/fail) must see the raw record, not the
+        // expiry-filtered view from get(): the owner may finish an operation whose
+        // claim TTL elapsed mid-flight, and losing that record would drop a
+        // successful result. Ownership/status checks in the callers still apply.
+        $record = $this->records[$this->recordKey($key, $scope)] ?? null;
 
         if ($record === null) {
             throw new RecordNotFoundException(sprintf('Record not found: key "%s", scope "%s".', $key, $scope));
@@ -209,6 +228,8 @@ final class InMemoryIdempotencyStore implements IdempotencyStore, ExpirableStore
 
     private function recordKey(string $key, string $scope): string
     {
-        return $scope . '::' . $key;
+        // Length-prefixed encoding so distinct (scope, key) pairs can never collide
+        // (e.g. scope "a:b"/key "c" vs scope "a"/key "b:c").
+        return sprintf('%d:%s:%d:%s', strlen($scope), $scope, strlen($key), $key);
     }
 }

@@ -16,6 +16,16 @@ use Shamanzpua\Idempotency\Core\ValueObject\Ttl;
 
 interface IdempotencyStore
 {
+    /**
+     * Acquires the claim for the pair.
+     *
+     * A non-expired FAILED record is reported as {@see ClaimStatus::ALREADY_FAILED}
+     * and left untouched unless $reclaimFailed is true, in which case it is
+     * atomically reclaimed (CLAIMED) for a retry. Expired records are always
+     * reclaimable regardless of the flag. This lets the engine honour
+     * FailedStrategy::THROW (do not re-run a failed operation) versus RETRY
+     * (atomic reclaim) without a separate round-trip.
+     */
     public function claim(
         string $key,
         string $scope,
@@ -23,8 +33,22 @@ interface IdempotencyStore
         ExecutionId $executionId,
         Ttl $ttl,
         \DateTimeImmutable $now,
+        bool $reclaimFailed = false,
     ): ClaimResult;
 
+    /**
+     * Returns the active record for the pair, or null.
+     *
+     * The contract is uniform across all stores:
+     *
+     *   - no record            → null
+     *   - logically expired    → null
+     *   - active (not expired)  → IdempotencyRecord
+     *
+     * "Expired" is decided against the store's clock. Physical removal of expired
+     * rows is left to {@see ExpirableStore::deleteExpired()} (Redis relies on
+     * native TTL); correctness must not depend on how often cleanup runs.
+     */
     public function get(string $key, string $scope): ?IdempotencyRecord;
 
     public function complete(

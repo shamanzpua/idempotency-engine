@@ -21,21 +21,45 @@ use Shamanzpua\Idempotency\Exception\StoreException;
 use Shamanzpua\Idempotency\Exception\StoreViolationException;
 use Shamanzpua\Idempotency\Infrastructure\Store\Pdo\Dialect\MySqlDialect;
 use Shamanzpua\Idempotency\Infrastructure\Store\Pdo\Dialect\PdoDialect;
+use Shamanzpua\Idempotency\Support\Clock\Clock;
+use Shamanzpua\Idempotency\Support\Clock\SystemClock;
 
-final class PdoIdempotencyStore implements IdempotencyStore, ExpirableStore
+/**
+ * Not final so the transactional claim attempt can be overridden for decoration
+ * and testing (see {@see self::attemptClaim()}).
+ */
+class PdoIdempotencyStore implements IdempotencyStore, ExpirableStore
 {
+    /**
+     * Bounds retries when a conflicting row is deleted (e.g. by a concurrent
+     * deleteExpired()) between the upsert and the locking read.
+     */
+    private const MAX_CLAIM_ATTEMPTS = 3;
+
     public function __construct(
         private readonly \PDO $pdo,
         ?PdoRecordMapper $mapper = null,
         private readonly string $table = 'idempotency_records',
         private readonly PdoDialect $dialect = new MySqlDialect(),
+        private readonly Clock $clock = new SystemClock(),
     ) {
         if (preg_match('/^[A-Za-z_][A-Za-z0-9_]*$/', $this->table) !== 1) {
             throw new \InvalidArgumentException('Invalid table name format.');
         }
 
+        // The store relies on exceptions for error handling and must not mutate a
+        // connection it does not own. Require the caller's PDO to already be in
+        // exception mode instead of silently flipping a shared attribute.
+        if ($this->pdo->getAttribute(\PDO::ATTR_ERRMODE) !== \PDO::ERRMODE_EXCEPTION) {
+            throw new \InvalidArgumentException(
+                'The PDO connection must use PDO::ERRMODE_EXCEPTION. Configure it via '
+                . 'new PDO($dsn, $user, $pass, [PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION]) '
+                . 'or $pdo->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION) before '
+                . 'passing it to the store.',
+            );
+        }
+
         $this->mapper = $mapper ?? new PdoRecordMapper($this->dialect);
-        $this->pdo->setAttribute(\PDO::ATTR_ERRMODE, \PDO::ERRMODE_EXCEPTION);
     }
 
     private readonly PdoRecordMapper $mapper;
@@ -47,7 +71,35 @@ final class PdoIdempotencyStore implements IdempotencyStore, ExpirableStore
         ExecutionId $executionId,
         Ttl $ttl,
         \DateTimeImmutable $now,
+        bool $reclaimFailed = false,
     ): ClaimResult {
+        for ($attempt = 1; $attempt <= self::MAX_CLAIM_ATTEMPTS; $attempt++) {
+            $result = $this->attemptClaim($key, $scope, $fingerprint, $executionId, $ttl, $now, $reclaimFailed);
+            if ($result !== null) {
+                return $result;
+            }
+        }
+
+        throw new StoreException('Failed to claim idempotency record: conflicting row repeatedly vanished during claim.');
+    }
+
+    /**
+     * Performs a single transactional claim attempt.
+     *
+     * Returns null to signal a retryable condition: the upsert reported a
+     * conflict, but the conflicting row was gone by the locking read (e.g. a
+     * concurrent deleteExpired() removed it). Genuine failures raise
+     * StoreException; all other outcomes return a ClaimResult.
+     */
+    protected function attemptClaim(
+        string $key,
+        string $scope,
+        Fingerprint $fingerprint,
+        ExecutionId $executionId,
+        Ttl $ttl,
+        \DateTimeImmutable $now,
+        bool $reclaimFailed = false,
+    ): ?ClaimResult {
         $expiresAt = $now->modify(sprintf('+%d seconds', $ttl->inSeconds()));
 
         try {
@@ -67,7 +119,12 @@ final class PdoIdempotencyStore implements IdempotencyStore, ExpirableStore
 
             $existing = $this->fetchForUpdate($key, $scope);
             if ($existing === null) {
-                throw new \LogicException('Upsert reported conflict but row not found.');
+                // The conflicting row was deleted between the upsert and the
+                // locking read (e.g. a concurrent deleteExpired()). Nothing to
+                // lock; end this empty transaction and signal a retry.
+                $this->pdo->commit();
+
+                return null;
             }
 
             // A freshly generated execution id can only match if this call inserted
@@ -95,6 +152,12 @@ final class PdoIdempotencyStore implements IdempotencyStore, ExpirableStore
             }
 
             if ($existing->status === RecordStatus::FAILED) {
+                if (!$reclaimFailed) {
+                    $this->pdo->commit();
+
+                    return new ClaimResult(ClaimStatus::ALREADY_FAILED, $existing, null);
+                }
+
                 $reclaimed = $this->rewriteAsInProgress($existing, $fingerprint, $executionId, $now, $expiresAt);
                 $this->pdo->commit();
 
@@ -133,7 +196,16 @@ final class PdoIdempotencyStore implements IdempotencyStore, ExpirableStore
             }
 
             /** @var array<string, mixed> $row */
-            return $this->mapper->mapRowToRecord($row);
+            $record = $this->mapper->mapRowToRecord($row);
+
+            // Logically expired records are treated as absent for a uniform,
+            // expiry-aware get() contract across all stores (see IdempotencyStore).
+            // Physical removal is left to deleteExpired().
+            if ($record->expiresAt <= $this->clock->now()) {
+                return null;
+            }
+
+            return $record;
         } catch (\Throwable $exception) {
             throw new StoreException('Failed to read idempotency record.', 0, $exception);
         }

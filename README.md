@@ -1,8 +1,13 @@
 # Idempotency Engine
 
-Framework-agnostic PHP library for executing an operation **exactly once per idempotency key**
-and replaying its stored result on retries. Built for payment operations, webhook handlers,
-API idempotency keys and at-least-once queue consumers.
+Framework-agnostic PHP library for **single-flight execution, duplicate suppression and result
+replay per idempotency key**: at most one active execution per `(scope, key)`, with retries
+returning the stored result. Built for payment operations, webhook handlers, API idempotency
+keys and at-least-once queue consumers.
+
+> Not a strict exactly-once guarantee — see [Guarantees and limitations](#guarantees-and-limitations).
+> For critical side effects, combine it with a provider-side idempotency key, a unique DB
+> constraint and/or a transactional outbox.
 
 - **Atomic claim** — one writer wins per `(scope, key)`; no check-then-act races
   (single upsert + row lock in SQL, single Lua script in Redis).
@@ -45,14 +50,16 @@ use Shamanzpua\Idempotency\Core\Engine\DefaultIdempotencyEngine;
 use Shamanzpua\Idempotency\Core\Model\ExecutionOptions;
 use Shamanzpua\Idempotency\Core\Policy\DefaultExecutionPolicy;
 use Shamanzpua\Idempotency\Core\Service\ExecutionRunner;
-use Shamanzpua\Idempotency\Infrastructure\Fingerprint\Sha256FingerprintGenerator;
+use Shamanzpua\Idempotency\Infrastructure\Fingerprint\CanonicalJsonFingerprintGenerator;
 use Shamanzpua\Idempotency\Infrastructure\Serialization\JsonResultSerializer;
 use Shamanzpua\Idempotency\Infrastructure\Store\Pdo\PdoIdempotencyStore;
 use Shamanzpua\Idempotency\Support\Clock\SystemClock;
 
+$pdo = new PDO($dsn, $user, $password, [PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION]);
+
 $engine = new DefaultIdempotencyEngine(
-    store: new PdoIdempotencyStore(new PDO($dsn, $user, $password)),
-    fingerprintGenerator: new Sha256FingerprintGenerator(),
+    store: new PdoIdempotencyStore($pdo),
+    fingerprintGenerator: new CanonicalJsonFingerprintGenerator(),
     serializer: new JsonResultSerializer(),
     policy: new DefaultExecutionPolicy(),
     runner: new ExecutionRunner(),
@@ -102,8 +109,7 @@ new ExecutionOptions(
 |---|---|
 | `FingerprintMismatchException` | Same key, different payload — client bug or key reuse. |
 | `OperationInProgressException` | Another execution is active (THROW strategy, or WAIT timed out). |
-| `OperationStalledException` | The in-progress record is stale (holder likely crashed); retry after its TTL expires. |
-| `OperationFailedException` | Previous attempt failed and `failedStrategy` is THROW. |
+| `OperationFailedException` | A prior attempt failed and `failedStrategy` is THROW, or a caller observed an already-failed record under `RETRY` with the budget exhausted. (When a caller exhausts *its own* retries, the operation's original exception is re-thrown instead.) |
 | `StoreException` | Backend I/O failure. |
 
 ## Record lifecycle
@@ -118,9 +124,16 @@ reclaimed by a new execution. Completed results are replayed until the record ex
 
 - The claim does **not** rely on the driver's affected-rows reporting on MySQL, so connections
   with `PDO::MYSQL_ATTR_FOUND_ROWS` are safe (at the cost of one extra indexed `SELECT` per claim).
-- The store sets `PDO::ATTR_ERRMODE` to `ERRMODE_EXCEPTION` on the connection you pass in.
-- Timestamps are stored without timezone information. Run every process that touches the same
-  table with the same PHP timezone — UTC is strongly recommended.
+- The connection **must** already use `PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION`; the store
+  no longer mutates your (possibly shared) connection and throws `InvalidArgumentException` if it
+  is configured otherwise.
+- `claim()` opens and commits its own transaction, so it **must not** run inside an ambient
+  transaction you started (PDO has no true nested transactions). Give the store a dedicated
+  connection, or call it outside your own `beginTransaction()`/`commit()` block.
+- Timestamps are persisted as canonical UTC wall-clock values regardless of the process
+  timezone, so `expires_at` comparisons stay correct across workers in different zones.
+- `scope` and `idempotency_key` are case-sensitive, byte-exact and NOT PAD — trailing spaces
+  are significant (MySQL uses `VARBINARY`). Keep them under 191 bytes.
 - Expired rows are not removed automatically; schedule
   [`resources/sql/cleanup_expired.mysql.sql`](resources/sql/cleanup_expired.mysql.sql) (or an
   equivalent) via cron, or call `deleteExpired()` (`ExpirableStore`) from your scheduler.
@@ -129,13 +142,19 @@ reclaimed by a new execution. Completed results are replayed until the record ex
 
 - All mutations are single atomic Lua scripts; key expiry uses native Redis TTL
   (`deleteExpired()` is a no-op).
+- The claim sets the physical key TTL to the claim `ttl`, so a record is evicted exactly at
+  its logical expiry (unlike PDO, whose rows linger until garbage-collected). An operation that
+  outruns its claim `ttl` therefore loses its record before it can `complete()`. Set claim
+  `ttl` above the worst-case operation duration (see Guarantees and limitations).
+- Timestamps are normalized to UTC before they reach the Lua expiry comparison, so a fleet
+  spread across timezones (or crossing a DST boundary) never mis-orders a live lease as expired.
 - Pass a "plain" client: phpredis with `OPT_SERIALIZER` or `OPT_PREFIX` configured is **not**
   supported — Lua scripts write raw JSON which a serializer would corrupt and a prefix would
   split into different keys. Use a dedicated connection if your app configures those options.
 - Replay durability depends on Redis persistence settings (`appendonly`/`save`); a restart
   without persistence forgets in-flight and completed records.
-- Redis Cluster: scripts are single-key, so any setup works; keys follow the
-  `prefix:scope:key` format.
+- Redis Cluster: scripts are single-key, so any setup works. Keys use a length-prefixed
+  `prefix:<len>:scope:<len>:key` encoding so distinct `(scope, key)` pairs never collide.
 
 ### InMemory
 
@@ -150,6 +169,10 @@ What the engine guarantees (per supported store):
   cross-process concurrency stress tests for all three backends.
 - Only the claim owner can publish a result or a failure.
 - A replayed result is byte-identical to the stored serialization of the first result.
+- A logically expired record is never replayed: `get()` reports it as absent across every
+  store, and a fresh call re-executes.
+- A previously failed operation is not silently re-run: with `FailedStrategy::THROW` a fresh
+  call raises `OperationFailedException`; with `RETRY` it is atomically reclaimed.
 
 What it does **not** guarantee:
 
@@ -161,14 +184,25 @@ What it does **not** guarantee:
 - **Object round-trips through replay.** `JsonResultSerializer` returns associative arrays for
   any objects in the result. Return JSON-friendly data from operations, or plug in your own
   `ResultSerializer`.
-- **Canonical fingerprints.** The default fingerprint is `sha256(json_encode($payload))` —
-  array key order matters. Normalize payloads before passing them, or provide an explicit
-  `fingerprint`. Without `payload` or `fingerprint`, the fingerprint falls back to the key
-  alone and payload-mismatch protection is disabled.
+- **Fingerprint canonicalization is opt-in.** `CanonicalJsonFingerprintGenerator` (recommended)
+  makes fingerprints order-independent and version-prefixed (`v1:…`); the older
+  `Sha256FingerprintGenerator` hashes raw `json_encode($payload)`, so array key order matters.
+  Without `payload` or `fingerprint`, the fingerprint falls back to the key alone and
+  payload-mismatch protection is disabled.
 - **Non-blocking waits.** `InProgressStrategy::WAIT` polls with `usleep()` and blocks the
   current process; avoid long waits inside synchronous HTTP workers.
-- **Heartbeat staleness detection.** A crashed holder blocks the key until the claim TTL
-  expires; size `ttl` accordingly.
+- **Heartbeat staleness detection.** There is no mid-flight liveness signal: a crashed holder
+  keeps the claim until its lease (claim `ttl`) expires. Once expired, the record is treated
+  as absent and the next claim (or a `WAIT` poll) automatically takes it over and re-executes;
+  there is no separate "stalled" exception. Size `ttl` accordingly (see below).
+- **Claim TTL must exceed the worst-case operation duration.** The claim `ttl` is the lease, and
+  completing *after* it has expired is outside the supported contract: another worker may have
+  already taken the key over, so the outcome of a late `complete()`/`fail()` is store-specific and
+  must not be relied on. On PDO/InMemory a late completion by the last owner may still succeed
+  until the row is garbage-collected; on **Redis** the key is evicted at the lease boundary
+  (native TTL), so a late `complete()` finds nothing and the successful result is lost with a
+  `RuntimeException`. Always set `ttl` comfortably above the slowest expected run. Heartbeat /
+  lease-renewal (and a uniform expired-lease rejection) are not provided in 1.0.
 
 ## Testing
 
@@ -179,7 +213,11 @@ composer test          # unit + integration (needs MySQL, PostgreSQL, Redis; see
 
 Integration suites read `DB_DSN`/`DB_USER`/`DB_PASSWORD` (MySQL), `PG_DB_DSN`/`PG_DB_USER`/
 `PG_DB_PASSWORD` (PostgreSQL) and `REDIS_DSN`. Cross-process claim contention tests live in
-`tests/Integration/Concurrency/`.
+`tests/Integration/Concurrency/`, and one behavioural contract is run against every store in
+`tests/Integration/Contract/` to keep all supported lifecycle scenarios observably identical
+across backends. CI runs the full MySQL/PostgreSQL/Redis integration suite on PHP 8.2–8.5,
+including both the Predis and phpredis adapters, plus a MariaDB compatibility job, on every pull
+request, on pushes to `main` and release branches, and on version tags.
 
 ## License
 

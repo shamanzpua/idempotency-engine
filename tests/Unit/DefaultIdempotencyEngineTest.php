@@ -21,12 +21,13 @@ use Shamanzpua\Idempotency\Enum\FailedStrategy;
 use Shamanzpua\Idempotency\Enum\InProgressStrategy;
 use Shamanzpua\Idempotency\Exception\OwnershipViolationException;
 use Shamanzpua\Idempotency\Exception\FingerprintMismatchException;
+use Shamanzpua\Idempotency\Exception\OperationFailedException;
 use Shamanzpua\Idempotency\Exception\OperationInProgressException;
-use Shamanzpua\Idempotency\Exception\OperationStalledException;
 use Shamanzpua\Idempotency\Infrastructure\Fingerprint\Sha256FingerprintGenerator;
 use Shamanzpua\Idempotency\Infrastructure\Serialization\JsonResultSerializer;
 use Shamanzpua\Idempotency\Infrastructure\Store\InMemory\InMemoryIdempotencyStore;
 use Shamanzpua\Idempotency\Support\Clock\Clock;
+use Shamanzpua\Idempotency\Tests\Support\FixedClock;
 
 final class DefaultIdempotencyEngineTest extends TestCase
 {
@@ -169,7 +170,7 @@ final class DefaultIdempotencyEngineTest extends TestCase
 
     public function testThrowsWhenOperationAlreadyInProgressAndStrategyIsThrow(): void
     {
-        $store = new InMemoryIdempotencyStore();
+        $store = new InMemoryIdempotencyStore(new FixedClock());
         $clock = new FrozenClock();
         $fingerprintGenerator = new Sha256FingerprintGenerator();
         $serializer = new JsonResultSerializer();
@@ -209,7 +210,7 @@ final class DefaultIdempotencyEngineTest extends TestCase
     {
         $clock = new TickingClock();
         $fingerprint = Fingerprint::fromString('fp-wait');
-        $delegate = new InMemoryIdempotencyStore();
+        $delegate = new InMemoryIdempotencyStore(new FixedClock());
         $owner = ExecutionId::generate();
 
         $delegate->claim('op-4', 'default', $fingerprint, $owner, Ttl::fromSeconds(60), $clock->now());
@@ -243,7 +244,7 @@ final class DefaultIdempotencyEngineTest extends TestCase
 
     public function testWaitStrategyHonorsTimeoutOptions(): void
     {
-        $store = new InMemoryIdempotencyStore();
+        $store = new InMemoryIdempotencyStore(new FixedClock());
         $clock = new TickingClock(stepMs: 10);
         $fingerprint = Fingerprint::fromString('fp-timeout');
 
@@ -282,10 +283,56 @@ final class DefaultIdempotencyEngineTest extends TestCase
         );
     }
 
-    public function testWaitStrategyThrowsOperationStalledForStaleInProgressRecord(): void
+    public function testFreshCallDoesNotReExecuteFailedOperationWhenStrategyIsThrow(): void
     {
-        $clock = new TickingClock();
-        $store = new StaleInProgressStore($clock);
+        $engine = $this->createEngine();
+        $calls = 0;
+        $options = new ExecutionOptions(
+            failedStrategy: FailedStrategy::THROW,
+            fingerprint: Fingerprint::fromString('fp-failed-throw'),
+        );
+
+        try {
+            $engine->execute(
+                key: 'op-failed-throw',
+                operation: function () use (&$calls): string {
+                    $calls++;
+
+                    throw new \RuntimeException('boom');
+                },
+                options: $options,
+            );
+            self::fail('Expected RuntimeException was not thrown.');
+        } catch (\RuntimeException $exception) {
+            self::assertSame('boom', $exception->getMessage());
+        }
+
+        self::assertSame(1, $calls);
+
+        // A fresh call for the same key with THROW must surface the previous
+        // failure instead of silently re-running the operation.
+        try {
+            $engine->execute(
+                key: 'op-failed-throw',
+                operation: function () use (&$calls): string {
+                    $calls++;
+
+                    return 'should-not-run';
+                },
+                options: $options,
+            );
+            self::fail('Expected OperationFailedException was not thrown.');
+        } catch (OperationFailedException) {
+            // expected
+        }
+
+        self::assertSame(1, $calls);
+    }
+
+    public function testWaitTakesOverWhenExpiryAwareStoreHidesDeadHolder(): void
+    {
+        $clock = new FrozenClock();
+        $store = new ExpiredHolderThenReclaimStore($clock);
         $engine = new DefaultIdempotencyEngine(
             store: $store,
             fingerprintGenerator: new Sha256FingerprintGenerator(),
@@ -296,13 +343,16 @@ final class DefaultIdempotencyEngineTest extends TestCase
             defaultTtl: Ttl::fromSeconds(60),
         );
 
-        $this->expectException(OperationStalledException::class);
+        $calls = 0;
+        $result = $engine->execute(
+            key: 'op-takeover',
+            operation: function () use (&$calls): array {
+                $calls++;
 
-        $engine->execute(
-            key: 'op-stalled',
-            operation: static fn (): string => 'will-not-run',
+                return ['taken' => 'over', 'seq' => $calls];
+            },
             options: new ExecutionOptions(
-                fingerprint: Fingerprint::fromString('fp-stalled'),
+                fingerprint: Fingerprint::fromString('fp-takeover'),
                 inProgressStrategy: InProgressStrategy::WAIT,
                 waitTimeoutMs: 1_000,
                 initialBackoffMs: 1,
@@ -310,6 +360,11 @@ final class DefaultIdempotencyEngineTest extends TestCase
                 jitterRatio: 0,
             ),
         );
+
+        // The holder's lease expired (get() returns null); the waiter takes over
+        // and runs the operation instead of spinning to the timeout.
+        self::assertSame(1, $calls);
+        self::assertSame(['taken' => 'over', 'seq' => 1], $result);
     }
 
     public function testRetriesOnceAfterFailureWhenStrategyIsRetry(): void
@@ -365,6 +420,102 @@ final class DefaultIdempotencyEngineTest extends TestCase
         self::assertSame(1, $calls);
     }
 
+    public function testReclaimingPreexistingFailedRecordHonoursRetryBudget(): void
+    {
+        $engine = $this->createEngine();
+        $fingerprint = Fingerprint::fromString('fp-reclaim-budget');
+
+        // Leave a FAILED record behind (one attempt, no retry budget).
+        try {
+            $engine->execute(
+                key: 'op-reclaim-budget',
+                operation: static fn (): never => throw new \RuntimeException('seed failure'),
+                options: new ExecutionOptions(
+                    failedStrategy: FailedStrategy::RETRY,
+                    maxRetries: 0,
+                    fingerprint: $fingerprint,
+                ),
+            );
+            self::fail('Expected RuntimeException was not thrown.');
+        } catch (\RuntimeException) {
+            // expected — record is now FAILED
+        }
+
+        // A fresh call reclaiming that FAILED record must honour maxRetries, not
+        // collapse to a single attempt.
+        $calls = 0;
+        $result = $engine->execute(
+            key: 'op-reclaim-budget',
+            operation: function () use (&$calls): array {
+                $calls++;
+
+                if ($calls <= 3) {
+                    throw new \RuntimeException('retry me');
+                }
+
+                return ['ok' => true, 'attempt' => $calls];
+            },
+            options: new ExecutionOptions(
+                failedStrategy: FailedStrategy::RETRY,
+                maxRetries: 3,
+                fingerprint: $fingerprint,
+            ),
+        );
+
+        self::assertSame(4, $calls);
+        self::assertSame(['ok' => true, 'attempt' => 4], $result);
+    }
+
+    public function testWaitRetryDoesNotReArmBudgetWhenContendingOverFailedRecord(): void
+    {
+        // Regression: a WAIT+RETRY caller that observes another worker's FAILED
+        // record must carry its *residual* retry budget through the wait+reclaim
+        // path. If handleFailedRecord re-armed a fresh maxRetries on every handoff,
+        // the operation could run past maxRetries + 1 for a single execute() call.
+        $clock = new FrozenClock();
+        $maxRetries = 2;
+        $store = new ContendedFailedRecordStore(new InMemoryIdempotencyStore($clock), interceptClaimAsInProgress: 2);
+        $engine = new DefaultIdempotencyEngine(
+            store: $store,
+            fingerprintGenerator: new Sha256FingerprintGenerator(),
+            serializer: new JsonResultSerializer(),
+            policy: new DefaultExecutionPolicy(),
+            runner: new ExecutionRunner(),
+            clock: $clock,
+            defaultTtl: Ttl::fromSeconds(60),
+        );
+
+        $calls = 0;
+        try {
+            $engine->execute(
+                key: 'op-contended',
+                operation: function () use (&$calls): never {
+                    $calls++;
+
+                    throw new \RuntimeException('always fails');
+                },
+                options: new ExecutionOptions(
+                    fingerprint: Fingerprint::fromString('fp-contended'),
+                    inProgressStrategy: InProgressStrategy::WAIT,
+                    failedStrategy: FailedStrategy::RETRY,
+                    maxRetries: $maxRetries,
+                    waitTimeoutMs: 1_000,
+                    initialBackoffMs: 1,
+                    maxBackoffMs: 5,
+                    jitterRatio: 0,
+                ),
+            );
+            self::fail('Expected RuntimeException was not thrown.');
+        } catch (\RuntimeException $exception) {
+            self::assertSame('always fails', $exception->getMessage());
+        }
+
+        // maxRetries + 1 is the hard ceiling on executions for one execute() call,
+        // even across the in-progress → failed → reclaim handoff.
+        self::assertLessThanOrEqual($maxRetries + 1, $calls);
+        self::assertSame($maxRetries + 1, $calls);
+    }
+
     public function testRetriesUpToConfiguredBudget(): void
     {
         $engine = $this->createEngine();
@@ -400,9 +551,37 @@ final class DefaultIdempotencyEngineTest extends TestCase
         new ExecutionOptions(maxRetries: -1);
     }
 
+    public function testThrowsForEmptyKey(): void
+    {
+        $engine = $this->createEngine();
+
+        $this->expectException(\InvalidArgumentException::class);
+        $this->expectExceptionMessage('Idempotency key cannot be empty.');
+
+        $engine->execute('', static fn (): string => 'x');
+    }
+
+    public function testThrowsForKeyExceedingMaxLength(): void
+    {
+        $engine = $this->createEngine();
+
+        $this->expectException(\InvalidArgumentException::class);
+        $this->expectExceptionMessage('cannot exceed');
+
+        $engine->execute(str_repeat('k', ExecutionOptions::MAX_KEY_LENGTH + 1), static fn (): string => 'x');
+    }
+
+    public function testThrowsForScopeExceedingMaxLength(): void
+    {
+        $this->expectException(\InvalidArgumentException::class);
+        $this->expectExceptionMessage('Scope cannot exceed');
+
+        new ExecutionOptions(scope: str_repeat('s', ExecutionOptions::MAX_KEY_LENGTH + 1));
+    }
+
     public function testStoreThrowsOwnershipViolationOnCompleteByAnotherOwner(): void
     {
-        $store = new InMemoryIdempotencyStore();
+        $store = new InMemoryIdempotencyStore(new FixedClock());
         $clock = new FrozenClock();
         $fingerprint = Fingerprint::fromString('fp-own');
 
@@ -428,7 +607,7 @@ final class DefaultIdempotencyEngineTest extends TestCase
 
     public function testMarksRecordAsFailedWhenCompletePersistenceThrows(): void
     {
-        $delegate = new InMemoryIdempotencyStore();
+        $delegate = new InMemoryIdempotencyStore(new FixedClock());
         $store = new CompleteThrowingStore($delegate);
         $clock = new FrozenClock();
         $engine = new DefaultIdempotencyEngine(
@@ -462,7 +641,7 @@ final class DefaultIdempotencyEngineTest extends TestCase
 
     public function testMarksRecordAsFailedWhenOperationThrowsStringCodeException(): void
     {
-        $store = new InMemoryIdempotencyStore();
+        $store = new InMemoryIdempotencyStore(new FixedClock());
         $clock = new FrozenClock();
         $engine = new DefaultIdempotencyEngine(
             store: $store,
@@ -500,7 +679,7 @@ final class DefaultIdempotencyEngineTest extends TestCase
     private function createEngine(): DefaultIdempotencyEngine
     {
         return new DefaultIdempotencyEngine(
-            store: new InMemoryIdempotencyStore(),
+            store: new InMemoryIdempotencyStore(new FixedClock()),
             fingerprintGenerator: new Sha256FingerprintGenerator(),
             serializer: new JsonResultSerializer(),
             policy: new DefaultExecutionPolicy(),
@@ -556,6 +735,7 @@ final class EventuallyCompletedStore implements IdempotencyStore
         ExecutionId $executionId,
         Ttl $ttl,
         \DateTimeImmutable $now,
+        bool $reclaimFailed = false,
     ): ClaimResult {
         return $this->delegate->claim($key, $scope, $fingerprint, $executionId, $ttl, $now);
     }
@@ -600,23 +780,74 @@ final class EventuallyCompletedStore implements IdempotencyStore
     }
 }
 
-final class StaleInProgressStore implements IdempotencyStore
+final class CompleteThrowingStore implements IdempotencyStore
 {
-    private readonly IdempotencyRecord $staleRecord;
+    public function __construct(private readonly InMemoryIdempotencyStore $delegate) {}
+
+    public function claim(
+        string $key,
+        string $scope,
+        Fingerprint $fingerprint,
+        ExecutionId $executionId,
+        Ttl $ttl,
+        \DateTimeImmutable $now,
+        bool $reclaimFailed = false,
+    ): ClaimResult {
+        return $this->delegate->claim($key, $scope, $fingerprint, $executionId, $ttl, $now);
+    }
+
+    public function get(string $key, string $scope): ?IdempotencyRecord
+    {
+        return $this->delegate->get($key, $scope);
+    }
+
+    public function complete(
+        string $key,
+        string $scope,
+        ExecutionId $executionId,
+        string $serializedResult,
+        \DateTimeImmutable $now,
+        ?Ttl $resultTtl = null,
+    ): void {
+        throw new \RuntimeException('complete failed');
+    }
+
+    public function fail(
+        string $key,
+        string $scope,
+        ExecutionId $executionId,
+        ErrorDetails $errorDetails,
+        \DateTimeImmutable $now,
+        ?Ttl $resultTtl = null,
+    ): void {
+        $this->delegate->fail($key, $scope, $executionId, $errorDetails, $now, $resultTtl);
+    }
+}
+
+/**
+ * First claim reports the key as in progress but its lease is already expired;
+ * get() hides it (as an expiry-aware store does), and the second claim (takeover)
+ * succeeds.
+ */
+final class ExpiredHolderThenReclaimStore implements IdempotencyStore
+{
+    private int $claimCount = 0;
+
+    private readonly IdempotencyRecord $expiredHolder;
 
     public function __construct(private readonly Clock $clock)
     {
         $now = $this->clock->now();
-        $this->staleRecord = new IdempotencyRecord(
-            key: 'op-stalled',
+        $this->expiredHolder = new IdempotencyRecord(
+            key: 'op-takeover',
             scope: 'default',
-            fingerprint: Fingerprint::fromString('fp-stalled'),
+            fingerprint: Fingerprint::fromString('fp-takeover'),
             status: \Shamanzpua\Idempotency\Enum\RecordStatus::IN_PROGRESS,
             executionId: ExecutionId::generate(),
             serializedResult: null,
             errorDetails: null,
-            createdAt: $now->modify('-10 minutes'),
-            updatedAt: $now->modify('-10 minutes'),
+            createdAt: $now->modify('-2 minutes'),
+            updatedAt: $now->modify('-2 minutes'),
             expiresAt: $now->modify('-1 second'),
         );
     }
@@ -628,21 +859,40 @@ final class StaleInProgressStore implements IdempotencyStore
         ExecutionId $executionId,
         Ttl $ttl,
         \DateTimeImmutable $now,
+        bool $reclaimFailed = false,
     ): ClaimResult {
+        $this->claimCount++;
+
+        if ($this->claimCount === 1) {
+            return new ClaimResult(
+                status: \Shamanzpua\Idempotency\Enum\ClaimStatus::ALREADY_IN_PROGRESS,
+                record: $this->expiredHolder,
+                executionId: null,
+            );
+        }
+
         return new ClaimResult(
-            status: \Shamanzpua\Idempotency\Enum\ClaimStatus::ALREADY_IN_PROGRESS,
-            record: $this->staleRecord,
-            executionId: null,
+            status: \Shamanzpua\Idempotency\Enum\ClaimStatus::CLAIMED,
+            record: new IdempotencyRecord(
+                key: $key,
+                scope: $scope,
+                fingerprint: $fingerprint,
+                status: \Shamanzpua\Idempotency\Enum\RecordStatus::IN_PROGRESS,
+                executionId: $executionId,
+                serializedResult: null,
+                errorDetails: null,
+                createdAt: $now,
+                updatedAt: $now,
+                expiresAt: $now->modify(sprintf('+%d seconds', $ttl->inSeconds())),
+            ),
+            executionId: $executionId,
         );
     }
 
     public function get(string $key, string $scope): ?IdempotencyRecord
     {
-        if ($key !== $this->staleRecord->key || $scope !== $this->staleRecord->scope) {
-            return null;
-        }
-
-        return $this->staleRecord;
+        // Expiry-aware store: the expired holder is reported as absent.
+        return null;
     }
 
     public function complete(
@@ -664,9 +914,21 @@ final class StaleInProgressStore implements IdempotencyStore
     ): void {}
 }
 
-final class CompleteThrowingStore implements IdempotencyStore
+/**
+ * Models a concurrent WAIT+RETRY race: every operation fails, and on the given
+ * claim attempt the store pretends another worker holds the lease
+ * (ALREADY_IN_PROGRESS) while the delegate still exposes the earlier FAILED
+ * record through get(). This drives the engine down the in-progress → failed →
+ * reclaim handoff, where a re-armed retry budget would over-execute.
+ */
+final class ContendedFailedRecordStore implements IdempotencyStore
 {
-    public function __construct(private readonly InMemoryIdempotencyStore $delegate) {}
+    private int $claimCount = 0;
+
+    public function __construct(
+        private readonly InMemoryIdempotencyStore $delegate,
+        private readonly int $interceptClaimAsInProgress,
+    ) {}
 
     public function claim(
         string $key,
@@ -675,8 +937,30 @@ final class CompleteThrowingStore implements IdempotencyStore
         ExecutionId $executionId,
         Ttl $ttl,
         \DateTimeImmutable $now,
+        bool $reclaimFailed = false,
     ): ClaimResult {
-        return $this->delegate->claim($key, $scope, $fingerprint, $executionId, $ttl, $now);
+        $this->claimCount++;
+
+        if ($this->claimCount === $this->interceptClaimAsInProgress) {
+            return new ClaimResult(
+                status: \Shamanzpua\Idempotency\Enum\ClaimStatus::ALREADY_IN_PROGRESS,
+                record: new IdempotencyRecord(
+                    key: $key,
+                    scope: $scope,
+                    fingerprint: $fingerprint,
+                    status: \Shamanzpua\Idempotency\Enum\RecordStatus::IN_PROGRESS,
+                    executionId: ExecutionId::generate(),
+                    serializedResult: null,
+                    errorDetails: null,
+                    createdAt: $now,
+                    updatedAt: $now,
+                    expiresAt: $now->modify(sprintf('+%d seconds', $ttl->inSeconds())),
+                ),
+                executionId: null,
+            );
+        }
+
+        return $this->delegate->claim($key, $scope, $fingerprint, $executionId, $ttl, $now, $reclaimFailed);
     }
 
     public function get(string $key, string $scope): ?IdempotencyRecord
@@ -692,7 +976,7 @@ final class CompleteThrowingStore implements IdempotencyStore
         \DateTimeImmutable $now,
         ?Ttl $resultTtl = null,
     ): void {
-        throw new \RuntimeException('complete failed');
+        $this->delegate->complete($key, $scope, $executionId, $serializedResult, $now, $resultTtl);
     }
 
     public function fail(
