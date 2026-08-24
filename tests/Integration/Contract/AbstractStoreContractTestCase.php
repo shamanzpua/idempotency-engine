@@ -176,4 +176,33 @@ abstract class AbstractStoreContractTestCase extends TestCase
 
         self::assertSame(ClaimStatus::CLAIMED, $reclaim->status);
     }
+
+    public function testExpiredRecordIsReclaimedEvenWhenFingerprintDiffers(): void
+    {
+        $now = $this->clock->now();
+        $owner = ExecutionId::generate();
+
+        $this->store->claim('op-reclaim-fp', 'orders', Fingerprint::fromString('v1:' . str_repeat('a', 64)), $owner, Ttl::fromSeconds(30), $now);
+        $this->store->complete('op-reclaim-fp', 'orders', $owner, '{"ok":true}', $now);
+
+        // Deliberate contract, not an oversight: every store checks expiry BEFORE
+        // the fingerprint, so payload-mismatch protection is bounded by the record
+        // TTL. Once the record has logically expired it is indistinguishable from
+        // absent, and a same-key call with a different payload is fresh work rather
+        // than a FINGERPRINT_MISMATCH. Reordering the two checks would silently
+        // change the published contract, so pin it here.
+        $later = $now->modify('+31 seconds');
+        $this->clock->set($later);
+
+        $reclaim = $this->store->claim(
+            'op-reclaim-fp',
+            'orders',
+            Fingerprint::fromString('v1:' . str_repeat('b', 64)),
+            ExecutionId::generate(),
+            Ttl::fromSeconds(30),
+            $later,
+        );
+
+        self::assertSame(ClaimStatus::CLAIMED, $reclaim->status);
+    }
 }

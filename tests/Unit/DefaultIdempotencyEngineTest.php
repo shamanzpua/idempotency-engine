@@ -100,6 +100,49 @@ final class DefaultIdempotencyEngineTest extends TestCase
         );
     }
 
+    public function testFingerprintProtectionIsBoundedByRecordTtl(): void
+    {
+        $clock = new FixedClock(new \DateTimeImmutable('2026-01-01T00:00:00+00:00'));
+        $engine = new DefaultIdempotencyEngine(
+            store: new InMemoryIdempotencyStore($clock),
+            fingerprintGenerator: new Sha256FingerprintGenerator(),
+            serializer: new JsonResultSerializer(),
+            policy: new DefaultExecutionPolicy(),
+            runner: new ExecutionRunner(),
+            clock: $clock,
+            defaultTtl: Ttl::fromSeconds(30),
+        );
+
+        $calls = 0;
+        $operation = function () use (&$calls): array {
+            $calls++;
+
+            return ['seq' => $calls];
+        };
+
+        $engine->execute(
+            key: 'op-ttl-bounded-fingerprint',
+            operation: $operation,
+            options: new ExecutionOptions(payload: ['amount' => 100]),
+        );
+
+        // Expiry is evaluated before the fingerprint, so payload-mismatch protection
+        // lasts only as long as the record: past the TTL the record reads as absent
+        // and the same key with a different payload is accepted as fresh work instead
+        // of raising FingerprintMismatchException. Documented in README (Guarantees
+        // and limitations); this test keeps the check order from changing silently.
+        $clock->set($clock->now()->modify('+31 seconds'));
+
+        $result = $engine->execute(
+            key: 'op-ttl-bounded-fingerprint',
+            operation: $operation,
+            options: new ExecutionOptions(payload: ['amount' => 200]),
+        );
+
+        self::assertSame(2, $calls);
+        self::assertSame(['seq' => 2], $result);
+    }
+
     public function testExplicitFingerprintOverridesPayloadFingerprint(): void
     {
         $engine = $this->createEngine();

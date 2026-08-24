@@ -25,6 +25,12 @@ interface IdempotencyStore
      * reclaimable regardless of the flag. This lets the engine honour
      * FailedStrategy::THROW (do not re-run a failed operation) versus RETRY
      * (atomic reclaim) without a separate round-trip.
+     *
+     * Expiry is checked BEFORE the fingerprint: an expired record is equivalent to
+     * an absent one, so a differing fingerprint on an expired record yields CLAIMED,
+     * not FINGERPRINT_MISMATCH. Fingerprint protection is therefore bounded by the
+     * record TTL; implementors must keep this order (pinned by the store contract
+     * test suite).
      */
     public function claim(
         string $key,

@@ -14,7 +14,8 @@ keys and at-least-once queue consumers.
 - **Ownership tokens** — only the execution that claimed a key can complete or fail it;
   a zombie worker gets `OwnershipViolationException` instead of silently overwriting state.
 - **Fingerprint protection** — a retry with the same key but a different payload is rejected
-  with `FingerprintMismatchException` (Stripe-style).
+  with `FingerprintMismatchException` (Stripe-style) for as long as the record lives
+  ([bounded by the TTL](#guarantees-and-limitations)).
 - **Result replay** — repeated calls return the stored result without re-executing.
 - **Conflict policies** — concurrent execution: throw or wait (polling with backoff + jitter);
   previous failure: throw or retry with a budget.
@@ -184,6 +185,14 @@ What it does **not** guarantee:
 - **Object round-trips through replay.** `JsonResultSerializer` returns associative arrays for
   any objects in the result. Return JSON-friendly data from operations, or plug in your own
   `ResultSerializer`.
+- **Unbounded fingerprint protection.** Expiry is evaluated *before* the fingerprint: a
+  logically expired record is indistinguishable from an absent one, so `claim()` reclaims it
+  and a same-key call with a different payload runs as fresh work instead of raising
+  `FingerprintMismatchException`. Payload-mismatch protection therefore lasts exactly as long
+  as the record (claim `ttl`, or `resultTtl` once completed) — the same window Stripe-style
+  APIs give an idempotency key. If your own durable state outlives the engine record (an order
+  row, a payment intent), compare the payload against *that* state rather than relying on the
+  engine to reject it forever.
 - **Fingerprint canonicalization is opt-in.** `CanonicalJsonFingerprintGenerator` (recommended)
   makes fingerprints order-independent and version-prefixed (`v1:…`); the older
   `Sha256FingerprintGenerator` hashes raw `json_encode($payload)`, so array key order matters.

@@ -4,6 +4,17 @@ All notable changes to this package are documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and the project adheres to [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Documentation
+
+- Documented that fingerprint (payload-mismatch) protection is bounded by the record
+  TTL: `claim()` evaluates expiry before the fingerprint, so an expired record is
+  indistinguishable from an absent one and a same-key call with a different payload is
+  reclaimed as fresh work instead of raising `FingerprintMismatchException`. Behaviour
+  is unchanged; it is now stated in the README, in the `IdempotencyStore::claim()`
+  contract, and pinned by tests so the check order cannot change silently.
+
 ## [1.0.0] - 2026-07-11
 
 Stable release. Hardening pass over `1.0.0-rc1`. See `UPGRADING.md` for migration notes.
